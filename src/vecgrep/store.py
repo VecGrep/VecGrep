@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
@@ -38,6 +37,18 @@ class VectorStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        self._vec_cache: np.ndarray | None = None
+        self._meta_cache: list[dict] | None = None
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> VectorStore:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # File hash helpers
@@ -51,6 +62,34 @@ class VectorStore:
         return {row[0]: row[1] for row in rows}
 
     # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _load_cache(self) -> None:
+        """Populate in-memory embedding cache if not already loaded."""
+        if self._vec_cache is not None:
+            return
+        rows = self._conn.execute(
+            "SELECT file_path, start_line, end_line, content, embedding FROM chunks"
+        ).fetchall()
+        if not rows:
+            self._vec_cache = np.empty((0, 384), dtype=np.float32)
+            self._meta_cache = []
+            return
+        self._meta_cache = [
+            {"file_path": r[0], "start_line": r[1], "end_line": r[2], "content": r[3]}
+            for r in rows
+        ]
+        blob = b"".join(r[4] for r in rows)
+        self._vec_cache = (
+            np.frombuffer(blob, dtype=np.float32).reshape(len(rows), -1).copy()
+        )
+
+    def _invalidate_cache(self) -> None:
+        self._vec_cache = None
+        self._meta_cache = None
+
+    # ------------------------------------------------------------------
     # Write helpers
     # ------------------------------------------------------------------
 
@@ -58,6 +97,7 @@ class VectorStore:
         """Remove all chunks for a given file."""
         self._conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
         self._conn.commit()
+        self._invalidate_cache()
 
     def add_chunks(self, rows: list[dict], vectors: np.ndarray) -> None:
         """
@@ -67,7 +107,8 @@ class VectorStore:
               content, file_hash, chunk_hash
         vectors: float32 array of shape (len(rows), 384) — pre-normalised
         """
-        assert len(rows) == len(vectors), "rows/vectors length mismatch"
+        if len(rows) != len(vectors):
+            raise ValueError("rows/vectors length mismatch")
         params = [
             (
                 r["file_path"],
@@ -87,6 +128,35 @@ class VectorStore:
             params,
         )
         self._conn.commit()
+        self._invalidate_cache()
+
+    def replace_file_chunks(
+        self, file_path: str, rows: list[dict], vectors: np.ndarray
+    ) -> None:
+        """Atomically delete existing chunks and insert new ones for a file."""
+        if len(rows) != len(vectors):
+            raise ValueError("rows/vectors length mismatch")
+        params = [
+            (
+                r["file_path"],
+                r["start_line"],
+                r["end_line"],
+                r["content"],
+                r["file_hash"],
+                r["chunk_hash"],
+                vectors[i].tobytes(),
+            )
+            for i, r in enumerate(rows)
+        ]
+        with self._conn:
+            self._conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+            self._conn.executemany(
+                "INSERT INTO chunks "
+                "(file_path, start_line, end_line, content, file_hash, chunk_hash, embedding) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params,
+            )
+        self._invalidate_cache()
 
     # ------------------------------------------------------------------
     # Search
@@ -97,28 +167,22 @@ class VectorStore:
         Cosine similarity search. query_vec must be pre-normalised (shape 384,).
         Returns list of dicts: {file_path, start_line, end_line, content, score}.
         """
-        rows = self._conn.execute(
-            "SELECT id, file_path, start_line, end_line, content, embedding FROM chunks"
-        ).fetchall()
+        self._load_cache()
+        assert self._vec_cache is not None
+        assert self._meta_cache is not None
 
-        if not rows:
+        if len(self._vec_cache) == 0:
             return []
 
-        ids = [r[0] for r in rows]
-        meta = [(r[1], r[2], r[3], r[4]) for r in rows]
-        vectors = np.frombuffer(b"".join(r[5] for r in rows), dtype=np.float32).reshape(
-            len(rows), -1
-        )
-
-        scores = vectors @ query_vec
+        scores = self._vec_cache @ query_vec
         top_indices = np.argsort(scores)[::-1][:top_k]
 
         return [
             {
-                "file_path": meta[i][0],
-                "start_line": meta[i][1],
-                "end_line": meta[i][2],
-                "content": meta[i][3],
+                "file_path": self._meta_cache[i]["file_path"],
+                "start_line": self._meta_cache[i]["start_line"],
+                "end_line": self._meta_cache[i]["end_line"],
+                "content": self._meta_cache[i]["content"],
                 "score": float(scores[i]),
             }
             for i in top_indices
@@ -145,7 +209,7 @@ class VectorStore:
         }
 
     def touch_last_indexed(self) -> None:
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         self._conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_indexed', ?)",
             (ts,),

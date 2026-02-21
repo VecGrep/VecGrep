@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -88,6 +89,22 @@ MAX_FILE_BYTES = 512 * 1024  # 512 KB — skip very large files
 EMBED_BATCH = 64
 
 # ---------------------------------------------------------------------------
+# Per-path indexing locks
+# ---------------------------------------------------------------------------
+
+_LOCK_REGISTRY: dict[str, threading.Lock] = {}
+_LOCK_REGISTRY_LOCK = threading.Lock()
+
+
+def _get_index_lock(path: str) -> threading.Lock:
+    """Return (and create if needed) a per-path threading.Lock."""
+    with _LOCK_REGISTRY_LOCK:
+        if path not in _LOCK_REGISTRY:
+            _LOCK_REGISTRY[path] = threading.Lock()
+        return _LOCK_REGISTRY[path]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -155,7 +172,7 @@ def _should_skip_file(file_path: Path) -> bool:
 def _walk_files(root: Path, gitignore_patterns: list[str]) -> list[Path]:
     """Collect all indexable files under root."""
     files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         # Prune directories in-place
         dirnames[:] = [
             d for d in dirnames
@@ -183,62 +200,78 @@ def _do_index(path: str, force: bool = False) -> str:
     if not root.exists():
         return f"Error: path does not exist: {path}"
 
-    store = _get_store(str(root))
-    gitignore = _load_gitignore(root)
-    all_files = _walk_files(root, gitignore)
+    lock = _get_index_lock(str(root))
+    if not lock.acquire(blocking=False):
+        return f"Error: indexing of {path} is already in progress"
 
-    existing_hashes = {} if force else store.get_file_hashes()
+    try:
+        gitignore = _load_gitignore(root)
+        all_files = _walk_files(root, gitignore)
 
-    new_chunks_rows: list[dict] = []
-    new_chunks_texts: list[str] = []
-    files_changed = 0
-    files_skipped = 0
+        with _get_store(str(root)) as store:
+            existing_hashes = {} if force else store.get_file_hashes()
 
-    for fp in all_files:
-        file_hash = _sha256_file(fp)
-        fp_str = str(fp)
+            # Orphan cleanup: remove chunks for files no longer on disk
+            all_file_strs = {str(fp) for fp in all_files}
+            orphan_paths = set(existing_hashes) - all_file_strs
+            for p in orphan_paths:
+                store.delete_file_chunks(p)
 
-        if not force and existing_hashes.get(fp_str) == file_hash:
-            files_skipped += 1
-            continue
+            files_changed = 0
+            files_skipped = 0
+            files_skipped_chunking = 0
+            total_new_chunks = 0
 
-        # Remove stale chunks for this file
-        if fp_str in existing_hashes:
-            store.delete_file_chunks(fp_str)
+            for fp in all_files:
+                file_hash = _sha256_file(fp)
+                fp_str = str(fp)
 
-        chunks = chunk_file(fp_str)
-        for chunk in chunks:
-            chunk_hash = _sha256_str(chunk.content)
-            new_chunks_rows.append(
-                {
-                    "file_path": fp_str,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                    "content": chunk.content,
-                    "file_hash": file_hash,
-                    "chunk_hash": chunk_hash,
-                }
-            )
-            new_chunks_texts.append(chunk.content)
+                if not force and existing_hashes.get(fp_str) == file_hash:
+                    files_skipped += 1
+                    continue
 
-        files_changed += 1
+                is_existing = fp_str in existing_hashes
 
-    # Embed and store in batches
-    total_new_chunks = len(new_chunks_rows)
-    if total_new_chunks > 0:
-        for i in range(0, total_new_chunks, EMBED_BATCH):
-            batch_rows = new_chunks_rows[i : i + EMBED_BATCH]
-            batch_texts = new_chunks_texts[i : i + EMBED_BATCH]
-            vecs = embed(batch_texts)
-            store.add_chunks(batch_rows, vecs)
+                chunks = chunk_file(fp_str)
+                if not chunks:
+                    files_skipped_chunking += 1
+                    continue
 
-    store.touch_last_indexed()
-    store.close()
+                rows = [
+                    {
+                        "file_path": fp_str,
+                        "start_line": c.start_line,
+                        "end_line": c.end_line,
+                        "content": c.content,
+                        "file_hash": file_hash,
+                        "chunk_hash": _sha256_str(c.content),
+                    }
+                    for c in chunks
+                ]
+                texts = [c.content for c in chunks]
 
-    return (
-        f"Indexed {files_changed} file(s), {total_new_chunks} chunk(s) added "
-        f"({files_skipped} file(s) skipped, unchanged)"
-    )
+                batch_vecs: list[np.ndarray] = []
+                for i in range(0, len(texts), EMBED_BATCH):
+                    batch_vecs.append(embed(texts[i : i + EMBED_BATCH]))
+                vecs = np.concatenate(batch_vecs)
+
+                if is_existing:
+                    store.replace_file_chunks(fp_str, rows, vecs)
+                else:
+                    store.add_chunks(rows, vecs)
+
+                files_changed += 1
+                total_new_chunks += len(chunks)
+
+            store.touch_last_indexed()
+
+        return (
+            f"Indexed {files_changed} file(s), {total_new_chunks} chunk(s) added, "
+            f"{len(orphan_paths)} orphan(s) removed "
+            f"({files_skipped} file(s) skipped, unchanged)"
+        )
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +295,10 @@ def index_codebase(path: str, force: bool = False) -> str:
     Returns:
         Summary: files indexed, chunks added, files skipped.
     """
-    return _do_index(path, force=force)
+    try:
+        return _do_index(path, force=force)
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -286,41 +322,51 @@ def search_code(query: str, path: str, top_k: int = 8) -> str:
         Formatted list of matching code chunks with file:line references and
         similarity scores.
     """
-    top_k = min(top_k, 20)
-    root = Path(path).resolve()
+    try:
+        if len(query) > 500:
+            return "Error: query is too long (max 500 characters)"
+        if not query.strip():
+            return "Error: query must not be empty"
 
-    store = _get_store(str(root))
-    status = store.status()
+        top_k = max(1, min(top_k, 20))
+        root = Path(path).resolve()
 
-    # Auto-index if no data
-    if status["total_chunks"] == 0:
-        store.close()
-        index_result = _do_index(str(root), force=False)
-        store = _get_store(str(root))
-        status = store.status()
-        if status["total_chunks"] == 0:
-            store.close()
-            return f"No indexable files found in {path}.\n(Index attempt: {index_result})"
+        # Check if index has data
+        with _get_store(str(root)) as store:
+            needs_index = store.status()["total_chunks"] == 0
 
-    query_vec = embed([query])[0]
-    results = store.search(query_vec, top_k=top_k)
-    store.close()
+        index_result: str | None = None
+        if needs_index:
+            index_result = _do_index(str(root), force=False)
 
-    if not results:
-        return "No results found. Try re-indexing with index_codebase()."
+        with _get_store(str(root)) as store:
+            if store.status()["total_chunks"] == 0:
+                msg = f"No indexable files found in {path}."
+                if index_result:
+                    msg += f"\n(Index attempt: {index_result})"
+                return msg
 
-    lines = [f"Top {len(results)} results for: '{query}'\n"]
-    for i, r in enumerate(results, 1):
-        # Make path relative for readability
-        try:
-            rel = str(Path(r["file_path"]).relative_to(root))
-        except ValueError:
-            rel = r["file_path"]
-        lines.append(f"[{i}] {rel}:{r['start_line']}-{r['end_line']} (score: {r['score']:.2f})")
-        lines.append(r["content"])
-        lines.append("")
+            query_vec = embed([query])[0]
+            results = store.search(query_vec, top_k=top_k)
 
-    return "\n".join(lines)
+        if not results:
+            return "No results found. Try re-indexing with index_codebase()."
+
+        lines = [f"Top {len(results)} results for: '{query}'\n"]
+        for i, r in enumerate(results, 1):
+            try:
+                rel = str(Path(r["file_path"]).relative_to(root))
+            except ValueError:
+                rel = r["file_path"]
+            lines.append(
+                f"[{i}] {rel}:{r['start_line']}-{r['end_line']} (score: {r['score']:.2f})"
+            )
+            lines.append(r["content"])
+            lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -334,19 +380,21 @@ def get_index_status(path: str) -> str:
     Returns:
         Index statistics: file count, chunk count, last indexed time, disk usage.
     """
-    root = Path(path).resolve()
-    store = _get_store(str(root))
-    s = store.status()
-    store.close()
+    try:
+        root = Path(path).resolve()
+        with _get_store(str(root)) as store:
+            s = store.status()
 
-    size_mb = s["index_size_bytes"] / (1024 * 1024)
-    return (
-        f"Index status for: {root}\n"
-        f"  Files indexed:  {s['total_files']}\n"
-        f"  Total chunks:   {s['total_chunks']}\n"
-        f"  Last indexed:   {s['last_indexed']}\n"
-        f"  Index size:     {size_mb:.1f} MB"
-    )
+        size_mb = s["index_size_bytes"] / (1024 * 1024)
+        return (
+            f"Index status for: {root}\n"
+            f"  Files indexed:  {s['total_files']}\n"
+            f"  Total chunks:   {s['total_chunks']}\n"
+            f"  Last indexed:   {s['last_indexed']}\n"
+            f"  Index size:     {size_mb:.1f} MB"
+        )
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # ---------------------------------------------------------------------------

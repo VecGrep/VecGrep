@@ -18,8 +18,16 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install dependencies
-        run: uv sync
+      - name: Install dependencies (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Cache sentence-transformers model
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: ${{ runner.os }}-st-model-all-MiniLM-L6-v2
 
       - name: Check imports & server loads
         run: |
@@ -33,4 +41,10 @@ jobs:
           "
 
       - name: Lint
-        run: uv run ruff check src/ || true
+        run: uv run ruff check src/ tests/
+
+      - name: Run tests
+        run: uv run pytest tests/ -v --tb=short
+
+      - name: Type check (non-blocking)
+        run: uv run pyright src/ || true
