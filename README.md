@@ -18,12 +18,11 @@ Incremental re-indexing via SHA256 file hashing skips unchanged files.
 
 ## Installation
 
-Requires [uv](https://docs.astral.sh/uv/).
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/yourname/vecgrep
-cd vecgrep
-uv sync
+pip install vecgrep        # standard pip
+uv tool install vecgrep   # uv tool (isolated, recommended)
 ```
 
 ## Claude Code integration
@@ -34,8 +33,8 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or 
 {
   "mcpServers": {
     "vecgrep": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/VecGrep", "run", "vecgrep"]
+      "command": "uvx",
+      "args": ["vecgrep"]
     }
   }
 }
@@ -44,8 +43,10 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or 
 Or with the CLI:
 
 ```bash
-claude mcp add vecgrep -- uv --directory /path/to/VecGrep run vecgrep
+claude mcp add vecgrep -- uvx vecgrep
 ```
+
+`uvx` downloads and runs VecGrep in an isolated environment on first use — no cloning or manual setup required.
 
 ## Tools
 
