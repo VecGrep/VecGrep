@@ -31,24 +31,15 @@ uv tool install vecgrep   # uv tool (isolated, recommended)
 
 ## Claude Code integration
 
-Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or via `claude mcp add`):
-
-```json
-{
-  "mcpServers": {
-    "vecgrep": {
-      "command": "uvx",
-      "args": ["vecgrep"]
-    }
-  }
-}
-```
-
-Or with the CLI:
+Run once — works for every project:
 
 ```bash
-claude mcp add vecgrep -- uvx vecgrep
+claude mcp add --scope user vecgrep -- uvx --python 3.12 vecgrep
 ```
+
+This registers VecGrep in your user config (`~/.claude.json`) so it's available globally across all projects without any per-project setup.
+
+> **Note:** `--python 3.12` is required because `tree-sitter-languages` does not yet have wheels for Python 3.13+. VecGrep requires Python 3.12.
 
 `uvx` downloads and runs VecGrep in an isolated environment on first use — no cloning or manual setup required.
 
