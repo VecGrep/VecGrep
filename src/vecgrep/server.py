@@ -3,12 +3,26 @@
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import hashlib
+import logging
 import os
 import threading
 import time
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
+
+
+def _stop_all_observers() -> None:
+    """Stop all background watchdog threads on process exit."""
+    for observer in list(_OBSERVER_REGISTRY.values()):
+        try:
+            observer.stop()
+            observer.join(timeout=2)
+        except Exception:
+            pass
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
@@ -150,6 +164,8 @@ def _load_gitignore(root: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 _OBSERVER_REGISTRY: dict[str, Observer] = {}
+atexit.register(_stop_all_observers)
+
 
 class LiveSyncHandler(FileSystemEventHandler):
     def __init__(self, root_path: str, gitignore_patterns: list[str]):
@@ -225,15 +241,19 @@ class LiveSyncHandler(FileSystemEventHandler):
                 store.replace_file_chunks(fp_str, rows, vecs)
                 store.touch_last_indexed()
         except Exception:
-            pass # Background swallow
+            _log.exception("LiveSync error processing %s", file_path_str)
         finally:
             lock.release()
 
     def _schedule_processing(self, file_path: str) -> None:
         if file_path in self._debounce_timers:
             self._debounce_timers[file_path].cancel()
-            
-        timer = threading.Timer(self._debounce_delay, self._process_file, args=[file_path])
+
+        def _run_and_cleanup() -> None:
+            self._process_file(file_path)
+            self._debounce_timers.pop(file_path, None)
+
+        timer = threading.Timer(self._debounce_delay, _run_and_cleanup)
         self._debounce_timers[file_path] = timer
         timer.start()
 
@@ -247,24 +267,27 @@ class LiveSyncHandler(FileSystemEventHandler):
             
     def on_deleted(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
-            # We handle deletion simply right now by letting the next full index clean it, 
-            # or optionally deleting it explicitly here.
             root = self.root_path
             fp = event.src_path
-            timer = threading.Timer(self._debounce_delay, self._delete_file, args=[root, fp])
             if fp in self._debounce_timers:
                 self._debounce_timers[fp].cancel()
+
+            def _run_and_cleanup() -> None:
+                self._delete_file(root, fp)
+                self._debounce_timers.pop(fp, None)
+
+            timer = threading.Timer(self._debounce_delay, _run_and_cleanup)
             self._debounce_timers[fp] = timer
             timer.start()
             
     def _delete_file(self, root: str, file_path: str) -> None:
-         lock = _get_index_lock(root)
-         if lock.acquire(blocking=False):
-             try:
-                 with _get_store(root) as store:
-                     store.delete_file_chunks(file_path)
-             finally:
-                 lock.release()
+        lock = _get_index_lock(root)
+        if lock.acquire(blocking=False):
+            try:
+                with _get_store(root) as store:
+                    store.delete_file_chunks(file_path)
+            finally:
+                lock.release()
 
 def _ensure_watcher(root: Path, gitignore: list[str]) -> None:
     root_str = str(root)
@@ -331,7 +354,7 @@ def _walk_files(root: Path, gitignore_patterns: list[str]) -> list[Path]:
     return files
 
 
-def _do_index(path: str, force: bool = False) -> str:
+def _do_index(path: str, force: bool = False, watch: bool = False) -> str:
     root = Path(path).resolve()
     if not root.exists():
         return f"Error: path does not exist: {path}"
@@ -416,9 +439,10 @@ def _do_index(path: str, force: bool = False) -> str:
                 total_new_chunks += len(chunks)
 
             store.touch_last_indexed()
-            
-        # Ensure the watcher is running for future live sync
-        _ensure_watcher(root, gitignore)
+
+        # Only start the background watcher when explicitly requested
+        if watch:
+            _ensure_watcher(root, gitignore)
 
         return (
             f"Indexed {files_changed} file(s), {total_new_chunks} chunk(s) added, "
@@ -435,7 +459,7 @@ def _do_index(path: str, force: bool = False) -> str:
 
 
 @mcp.tool()
-def index_codebase(path: str, force: bool = False) -> str:
+def index_codebase(path: str, force: bool = False, watch: bool = False) -> str:
     """
     Index a codebase directory for semantic search.
 
@@ -446,12 +470,13 @@ def index_codebase(path: str, force: bool = False) -> str:
     Args:
         path: Absolute path to the codebase root directory.
         force: If True, re-index all files even if unchanged.
+        watch: If True, start a background watcher for live sync on file changes.
 
     Returns:
         Summary: files indexed, chunks added, files skipped.
     """
     try:
-        return _do_index(path, force=force)
+        return _do_index(path, force=force, watch=watch)
     except Exception as e:
         return f"Error: {e}"
 

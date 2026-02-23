@@ -68,19 +68,21 @@ class VectorStore:
 
     def get_file_stats(self) -> dict[str, dict]:
         """Return {file_path: {'file_hash': hash, 'mtime': mtime, 'size': size}} for all indexed files."""
-        # Use to_list to avoid pandas dependency
         if self._table.count_rows() == 0:
             return {}
-            
-        rows = self._table.search().limit(None).to_list()
-        stats = {}
-        
-        # Latest stats per file
+
+        rows = (
+            self._table.search()
+            .select(["file_path", "file_hash", "mtime", "size"])
+            .limit(None)
+            .to_list()
+        )
+        stats: dict[str, dict] = {}
         for r in rows:
             stats[r["file_path"]] = {
                 "file_hash": r["file_hash"],
                 "mtime": r["mtime"],
-                "size": r["size"]
+                "size": r["size"],
             }
         return stats
 
@@ -95,7 +97,10 @@ class VectorStore:
 
     def delete_file_chunks(self, file_path: str) -> None:
         """Remove all chunks for a given file."""
-        self._table.delete(f"file_path = '{file_path}'")
+        # Use parameterised-style escaping: double any single quotes in the path
+        # to prevent SQL injection (LanceDB predicate syntax follows SQL quoting rules).
+        safe = file_path.replace("'", "''")
+        self._table.delete(f"file_path = '{safe}'")
 
     def add_chunks(self, rows: list[dict], vectors: np.ndarray) -> None:
         """
@@ -132,12 +137,35 @@ class VectorStore:
     def replace_file_chunks(
         self, file_path: str, rows: list[dict], vectors: np.ndarray
     ) -> None:
-        """Atomically delete existing chunks and insert new ones for a file."""
-        # LanceDB doesn't have strict atomic transactions across delete+add in the OSS version easily,
-        # but sequentially it's extremely fast. 
-        self.delete_file_chunks(file_path)
+        """Replace chunks for a file: add new rows first, then delete old ones by ID.
+
+        Adding before deleting means a crash leaves duplicates rather than gaps.
+        Duplicates are harmless and cleaned up on the next index run, whereas
+        gaps (from delete-then-add crashes) would cause files to disappear from search.
+        """
+        if len(rows) != len(vectors):
+            raise ValueError("rows/vectors length mismatch")
+
+        # Snapshot existing IDs before we add anything
+        safe = file_path.replace("'", "''")
+        existing_rows = (
+            self._table.search()
+            .where(f"file_path = '{safe}'")
+            .select(["id"])
+            .limit(None)
+            .to_list()
+        ) if self._table.count_rows() > 0 else []
+        old_ids = [r["id"] for r in existing_rows]
+
+        # Add new chunks first — crash here leaves both old and new (duplicates, not gaps)
         if rows:
             self.add_chunks(rows, vectors)
+
+        # Now remove only the old rows by their IDs
+        if old_ids:
+            # LanceDB delete predicate: id IN ('a', 'b', ...)
+            escaped = ", ".join(f"'{i.replace(chr(39), chr(39)+chr(39))}'" for i in old_ids)
+            self._table.delete(f"id IN ({escaped})")
 
     # ------------------------------------------------------------------
     # Search
@@ -180,11 +208,16 @@ class VectorStore:
 
     def status(self) -> dict:
         total_chunks = self._table.count_rows()
-        
+
         if total_chunks > 0:
-            # Use pyarrow to get distinct files without pandas
-            df = self._table.to_arrow()
-            total_files = len(pa.compute.unique(df["file_path"]))
+            # Project only file_path to avoid loading vectors (~75 MB on large indexes)
+            arrow = (
+                self._table.search()
+                .select(["file_path"])
+                .limit(None)
+                .to_arrow()
+            )
+            total_files = len(pa.compute.unique(arrow["file_path"]))
         else:
             total_files = 0
             
