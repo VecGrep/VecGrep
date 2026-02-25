@@ -8,8 +8,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from vecgrep.server import (
-    LiveSyncHandler,
     _OBSERVER_REGISTRY,
+    LiveSyncHandler,
     _do_index,
     _ensure_watcher,
     _get_index_lock,
@@ -308,7 +308,7 @@ class TestDoIndexEdgeCases:
 
     def test_no_chunks_for_existing_file_deletes(self, tmp_path):
         """If a file now produces no chunks, its old chunks are deleted."""
-        f = _write_py(tmp_path, "a.py", "def foo(): pass\n")
+        _write_py(tmp_path, "a.py", "def foo(): pass\n")
         _do_index(str(tmp_path))
 
         with patch("vecgrep.server.chunk_file", return_value=[]):
