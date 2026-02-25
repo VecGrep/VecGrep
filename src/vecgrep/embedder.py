@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+from sentence_transformers import SentenceTransformer  # type: ignore
+
+try:
+    import torch
+
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 # Embedding model: fine-tuned for semantic code search by @isuruwijesiri
 # Citation:
@@ -23,22 +31,17 @@ _device: str | None = None
 
 def _detect_device() -> str:
     """Return the best available compute device: cuda > mps > cpu."""
-    try:
-        import torch
+    if HAS_TORCH:
         if torch.cuda.is_available():
             return "cuda"
         if torch.backends.mps.is_available():
             return "mps"
-    except ImportError:
-        pass
     return "cpu"
 
 
 def _get_model():
     global _model, _device
     if _model is None:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-
         _device = _detect_device()
         _model = SentenceTransformer(MODEL_NAME, device=_device)
     return _model

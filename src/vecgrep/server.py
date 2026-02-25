@@ -17,7 +17,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from vecgrep.chunker import chunk_file
-from vecgrep.embedder import embed
+from vecgrep.embedder import _detect_device, embed
 from vecgrep.store import VectorStore
 
 _log = logging.getLogger(__name__)
@@ -575,8 +575,6 @@ def get_index_status(path: str) -> str:
         root = Path(path).resolve()
         with _get_store(str(root)) as store:
             s = store.status()
-
-        from vecgrep.embedder import _detect_device
 
         size_mb = s["index_size_bytes"] / (1024 * 1024)
         device = _detect_device()
