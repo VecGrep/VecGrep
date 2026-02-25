@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
+# Embedding model: fine-tuned for semantic code search by @isuruwijesiri
+# Citation:
+#   isuruwijesiri. (2026). all-MiniLM-L6-v2-code-search-512 [Model].
+#   Hugging Face. https://huggingface.co/isuruwijesiri/all-MiniLM-L6-v2-code-search-512
 MODEL_NAME = "isuruwijesiri/all-MiniLM-L6-v2-code-search-512"
 
 # Batch sizes tuned per device — GPU/MPS can saturate with larger batches
