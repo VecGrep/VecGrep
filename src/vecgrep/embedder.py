@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = "isuruwijesiri/all-MiniLM-L6-v2-code-search-512"
 _model = None
 
 

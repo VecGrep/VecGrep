@@ -447,6 +447,10 @@ def _do_index(path: str, force: bool = False, watch: bool = False) -> str:
 
             store.touch_last_indexed()
 
+            # Build ANN index when files changed (enables sub-linear search on large repos)
+            if files_changed > 0:
+                store.build_index()
+
         # Only start the background watcher when explicitly requested
         if watch:
             _ensure_watcher(root, gitignore)
