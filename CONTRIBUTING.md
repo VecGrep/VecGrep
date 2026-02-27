@@ -5,10 +5,20 @@ Thanks for your interest in contributing!
 ## Getting Started
 
 ```bash
-git clone https://github.com/iamvirul/vecgrep
-cd vecgrep
-uv sync
+git clone https://github.com/VecGrep/VecGrep
+cd VecGrep
+uv sync --extra dev
 ```
+
+### Install the git hooks
+
+Run once after cloning to enable the pre-commit lint check:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This runs `ruff` against staged Python files before every commit and blocks the commit if any violations are found.
 
 ## Development
 
