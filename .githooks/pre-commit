@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Pre-commit hook: lint check on staged Python files using ruff.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
+
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+echo "Running ruff lint check..."
+
+if command -v uv &>/dev/null; then
+    RUFF="uv run ruff"
+else
+    RUFF="ruff"
+fi
+
+if ! $RUFF check $STAGED; then
+    echo ""
+    echo "Lint check failed. Fix the issues above, re-stage the files, and commit again."
+    echo "To auto-fix:  $RUFF check --fix $STAGED"
+    exit 1
+fi
+
+echo "Lint check passed."
