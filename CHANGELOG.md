@@ -4,6 +4,35 @@ All notable changes to VecGrep are documented here.
 
 ---
 
+## [1.6.0] — 2026-03-02
+
+### Added
+
+- **Merkle tree change detection** — incremental re-indexing now uses a Merkle
+  tree to detect file changes, reducing unnecessary re-embedding on large
+  codebases with many unchanged files.
+- **Auto-reindex on startup** — when `watch=True`, VecGrep detects any files
+  that changed while the watcher was offline and re-indexes them automatically
+  on the next startup.
+- **`stop_watching` MCP tool** — new tool to stop the background file watcher
+  for a project without restarting the server.
+- **Watch state persistence** — watched project paths are persisted to disk so
+  the watcher can be restored after a server restart.
+
+### Fixed
+
+- Corrected `create_index` positional argument misuse in `VectorStore` that
+  could cause index builds to fail silently.
+- Fixed a race condition in the Merkle tree watcher that could cause duplicate
+  re-index events on rapid file saves.
+
+### Tests
+
+- Added full test coverage for Merkle tree edge cases, watch persistence,
+  auto-reindex on startup, and `stop_watching` tool.
+
+---
+
 ## [1.5.0] — 2026-02-28
 
 ### Breaking Changes
