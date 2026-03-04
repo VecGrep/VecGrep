@@ -18,7 +18,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from vecgrep.chunker import chunk_file
-from vecgrep.embedder import EmbeddingProvider, _detect_device, embed, get_provider
+from vecgrep.embedder import EmbeddingProvider, _detect_device, get_provider
 from vecgrep.store import VectorStore
 
 _log = logging.getLogger(__name__)
@@ -171,22 +171,23 @@ def _resolve_provider(path: str, requested: str | None, force: bool) -> Embeddin
     """Determine which provider to use and enforce the per-project lock.
 
     Rules:
-    - If no stored provider, use *requested* (or 'local' as default).
+    - If no stored provider (fresh/pre-BYOK index), use *requested* or 'local'.
     - If stored provider matches *requested* (or *requested* is None), use stored.
     - If stored differs from *requested* and force=False → raise RuntimeError.
     - If stored differs and force=True → allow switch (caller must recreate table).
     """
     with _get_store(path) as store:
-        meta = store.get_provider_meta()
-        stored_provider = meta["provider"]
+        # Read the raw meta key; None means the index was never built or predates BYOK
+        raw_stored = store._get_meta("provider")
 
-    # Treat 'unknown' stored provider as 'local' (pre-BYOK index)
-    if stored_provider == "unknown":
-        stored_provider = "local"
+    # No explicitly stored provider → treat as unset (fresh or pre-BYOK index)
+    if raw_stored is None or raw_stored == "unknown":
+        return get_provider(requested or "local")
 
+    stored_provider = raw_stored
     effective = requested or stored_provider
 
-    if requested and stored_provider != "unknown" and stored_provider != requested and not force:
+    if requested and stored_provider != requested and not force:
         raise RuntimeError(
             f"Index was built with provider '{stored_provider}'. "
             f"Switching to '{requested}' requires force=True to rebuild the index."
